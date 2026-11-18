@@ -1,0 +1,69 @@
+## Generic Macro Engine Blueprint (pseudocode)
+
+```
+# ---------- CONFIG / CALIBRATION ----------
+CalibrationManager:
+    load() -> dict from disk; if missing/corrupt -> defaults + prompt recalibrate
+    save(cfg)
+    validate(cfg) -> ensure all named regions/anchors exist & within screen bounds
+    get(key) / set(key,val)   # coordinate regions, delays, hotkeys, thresholds
+
+CONFIG = merge(defaults, calibration.load())
+CONFIG.save()  on change (debounced via QTimer)
+
+# ---------- TARGET VALIDATION ----------
+require_external(binary):
+    if not locate(binary) in PATH or common dirs: warn, disable dependent feature
+
+# ---------- SCREEN CAPTURE ----------
+capture(region):
+    img = ImageGrab.grab(bbox=region_to_bbox(CONFIG.region))
+    return preprocess(img)   # crop/scale/threshold as configured
+
+# ---------- STATE DETECTION ----------
+detect_state(screen_img, state_spec):
+    # state_spec: {template|ocr_region|pixel_probe, match_rule, threshold}
+    result = match(screen_img, state_spec)
+    return result.score >= state_spec.threshold
+    # fuzzy match / OCR text compare via fuzzywuzzy ratio
+
+wait_for_state(state, timeout, poll):
+    t0 = now()
+    while now()-t0 < timeout:
+        if detect_state(capture(...), state): return True
+        sleep(poll)
+    return False
+
+# ---------- INPUT INJECTION ----------
+inject_input(action):
+    switch action.kind:
+        click(x,y):    move_to(x,y); mouse_down(); mouse_up(delay=action.press_ms)
+        key(k,hold):   key_down(k); sleep(hold); key_up(k)
+        scroll(d):     move_to(x,y); wheel(d)
+    respect global input_lock (threading.Lock) to serialize
+    optional humanization: jitter coords/timing per config
+
+# ---------- TIMING / LOOP DRIVERS ----------
+main_loop(worker):
+    while RUNNING:
+        if hotkey_toggle_pressed: WORKER_ENABLED = not ENABLED
+        if not ENABLED: sleep(IDLE_POLL); continue
+        worker.tick()          # one detect->decide->act cycle
+        sleep(LOOP_DELAY + jitter())
+
+timer_driver(QTimer, interval=CONFIG.tick_ms, callback=main_loop.tick)  # UI-safe
+background_thread(target=main_loop)  # heavy work off UI thread
+    use signals to push status/log to UI
+
+# State machine
+tick():
+    s = detect_state()
+    action = transitions[s]  # dict lookup
+    if action: inject_input(action); sleep(action.post_delay)
+    else:      sleep(RETRY_DELAY)
+
+# ---------- LIFECYCLE ----------
+start(): RUNNING=True; spawn thread; timer.start()
+stop():  RUNNING=False; join(thread); timer.stop()
+shutdown(): save CONFIG; stop(); release inputs
+```

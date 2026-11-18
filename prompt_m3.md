@@ -1,0 +1,5 @@
+Write the M3 persistence layer of a macro engine, ONE pure Kotlin file (JVM java.io allowed, zero Android imports), package com.macroengine.core. Include:
+- const val SCHEMA_VERSION = 2 and class UnsupportedSchemaError(v: Int) : RuntimeException
+- data class GestureStatement(val kind: String, val x: Double, val y: Double, val speed: Double, val displayId: Int? = null)
+- object StatementCodec with fun write(out: java.io.DataOutputStream, s: GestureStatement) and fun read(inp: java.io.DataInputStream): GestureStatement. Fixed field order: version header, kind, x, y, speed; displayId is written only at version >= 2 and read ONLY when stored version >= 2 (default null for v1 records). Stored version newer than SCHEMA_VERSION throws UnsupportedSchemaError.
+- fun main() with check() tests: v2 round-trip deep-equal; a hand-built legacy v1 byte fixture (omitting displayId) loads with displayId == null; a version-99 header rejects with UnsupportedSchemaError; truncated stream fails cleanly. Print "ALL M3 TESTS PASSED" at the end.

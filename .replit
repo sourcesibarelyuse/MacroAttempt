@@ -1,0 +1,36 @@
+modules = ["python-3.12", "web", "java-graalvm22.3", "nodejs-24"]
+
+[nix]
+channel = "stable-25_05"
+packages = ["kotlin"]
+
+[agent]
+expertMode = true
+
+[workflows]
+runButton = "Project"
+
+[[workflows.workflow]]
+name = "Project"
+mode = "parallel"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "REA MCP server"
+
+[[workflows.workflow]]
+name = "REA MCP server"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "node scripts/rea.mjs mcp --http --host 127.0.0.1 --port 3000"
+
+[workflows.workflow.metadata]
+outputType = "console"
+
+[[ports]]
+localPort = 8080
+externalPort = 80
+exposeLocalhost = true

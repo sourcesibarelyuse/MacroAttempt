@@ -1,0 +1,55 @@
+# Generic Macro Engine Blueprint
+
+```
+CONFIG / CALIBRATION
+  loadConfig():
+    read persisted settings (screen size, target coords, delays)
+    if uncalibrated -> run calibration flow before enabling engine
+  onConfigChange(): reload + re-validate bounds
+
+STATE DETECTION  (observe-only, no injection)
+  onAccessibilityEvent(ev):
+    root = getRootInHierarchy()
+    if root null -> return
+    scan nodes matching predicate (text/id/desc)
+    when match found -> set STATE = READY / BUSY
+    publish state via static flag + timestamp
+  getState(): return cached state (last event) or re-scan root
+
+INPUT INJECTION
+  tap(x, y):
+    path = new Path(); path.moveTo(x, y)
+    gesture = StrokeDescription(path, 0, TAP_MS)
+    dispatchGesture(GestureDescription([gesture]))
+  swipe(points[], duration): build path across points, dispatch
+  multiSwipe(lines[]): one StrokeDescription per line, single GestureDescription
+  all injection goes through dispatchGesture; failure -> retry/report
+
+TIMING / DELAY LOOPS
+  handler = new Handler(mainLooper)
+  scheduleLoop(intervalMs, action):
+    runnable = () -> {
+        if engineEnabled and state == READY:
+            action()
+            guard elapsed(delta) against desired interval
+        handler.postDelayed(runnable, intervalMs)
+    }
+    handler.post(runnable)
+  delay(ms): handler.postDelayed(task, ms)
+  throttle: track lastRunTime; skip if now - lastRunTime < minInterval
+
+SERVICE LIFECYCLE
+  onServiceConnected(): set static singleton, handler, enable flag
+  onInterrupt() / onDestroy(): stop loop, clear handler, null singleton
+
+GLOBAL GUARDS
+  check accessibility granting + overlay permission
+  static singleton exposed for engine loop to call tap/swipe/getState
+```
+
+**Key generic patterns extracted**
+- **Singleton service + static state flags** for cross-component access to injection API.
+- **`dispatchGesture`/`GestureDescription`** wrapper as the sole input-injection primitive (tap = zero-length path stroke, swipe = multi-point path).
+- **Event-driven state cache**: `onAccessibilityEvent` updates a state variable; loop reads cache rather than re-scanning every tick.
+- **Handler-based recurring loop** with interval guard + `postDelayed` self-reschedule (classic macro timer).
+- **Config gating**: engine only fires loop actions when enabled AND state == READY.

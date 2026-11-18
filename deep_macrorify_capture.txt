@@ -1,0 +1,148 @@
+# Technical Report: `ActivityScreenCapture` — Android MediaProjection Launcher
+
+## 1. Core Architecture
+
+### Class Hierarchy
+
+```
+android.app.Activity
+  └── b.h (obfuscated base — likely AppCompat/Material activity)
+        └── D.l (obfuscated — likely custom base activity)
+              └── g0.ActivityC1901p (obfuscated)
+                    └── g.ActivityC1875f (obfuscated app base activity)
+                          └── com.kok_emm.mobile.activity.ActivityScreenCapture
+```
+
+The `@Override` annotation lists four superclass methods (`ActivityC1901p`, `b.h`, `D.l`, `Activity`), confirming a **multi-level custom activity hierarchy** — a common pattern in macro/automation apps to centralize permission handling, crash reporting, and theme/edge-to-edge setup.
+
+### Fields
+
+| Field | Type | Purpose |
+|-------|------|---------|
+| `f17057G` | `int` | `EMI` extra — likely "**E**mulator/Macro **I**nstance" or screen index for multi-display capture. |
+| `f17058H` | `int` | `SerTy` extra — "**Ser**vice **Ty**pe". Passed to the foreground capture service to tell it which operational mode to start (e.g., OCR vs. image matching vs. input-only). |
+| `f17059I` | `boolean` | `ImeCap` extra — "**Ime** **Cap**ture". Whether to capture keystrokes / IME events (implies an input-monitoring path in addition to pixels). |
+| `J` | `boolean` | `NoTr` extra — "**No** **Tr**ansparency" or "**No** **Tr**acking". Likely controls whether the floating status indicator/window is suppressed, or disables debug tracking. |
+| `f17060K` | `C1751g` | Result launcher. Created via `E(registry, contract)` — a **Activity Result API** wrapper (`registerForActivityResult`). |
+| `f17056L` | `static final int` | Compiler-generated `synthetic` ID for the lambda/anonymous contract reference (decompiler artifact). |
+
+### Design Patterns
+
+- **Launcher Activity (Facade)**: This activity is a *thin shim*. It does not perform capture itself; it requests system consent and forwards the result token to a service. This isolates the dangerous `MediaProjection` grant from the long-lived capture component.
+- **Activity Result Contract**: `C1751g` + `C1802c` implement `ActivityResultContract<Intent, Result>` — the modern replacement for `onActivityResult`. `C1802c` is almost certainly the `StartActivityForResult` contract instantiation.
+- **Registry / ViewModel scope**: The `E(...)` call is the standard `registerForActivityResult` invocation, wired to a lambda (`h(24, this)`) that executes the received grant.
+
+---
+
+## 2. Key Methods
+
+### `onCreate(Bundle)`
+
+This is the **only** meaningful method. Its sequence:
+
+1. **`super.onCreate(bundle)`** — runs the custom base activity's setup (theme, edge-to-edge, crash handler, etc.).
+2. **Intent parameter extraction** — reads four optional extras:
+   - `EMI` → `f17057G` (display / instance index)
+   - `SerTy` → `f17058H` (service type / mode selector)
+   - `ImeCap` → `f17059I` (IME capture flag)
+   - `NoTr` → `J` (no-tracking flag)
+   These are **configuration passed from the caller** (likely the app's main control activity) into this launcher so it can be re-emitted after the grant is received.
+3. **Obtain `MediaProjectionManager`** via `getSystemService("media_projection")`.
+4. **Construct the capture intent, version-gated on `Build.VERSION.SDK_INT`**:
+   - **SDK < 34 (Android ≤ 13)**: `mediaProjectionManager.createScreenCaptureIntent()` — the classic full-screen capture consent dialog.
+   - **SDK ≥ 34 (Android 14+)**: `mediaProjectionManager.createScreenCaptureIntent(MediaProjectionConfig.createConfigForDefaultDisplay())` — the new *per-session, single-display* consent model introduced in API 34, which forbids capturing system UI/dialogs by default and requires re-consent per projection.
+5. **Launch the consent dialog** via the registered launcher: `this.f17060K.a(intent)`.
+6. **Failure path**: any exception (notably `IllegalStateException` if another projection is active, or the service is unavailable) → show `R.string.oz` toast + `finish()`.
+
+There is **no input injection, no screen capture, no state detection** in this file — those live downstream in the service that receives the result. This activity is purely the **permission negotiation and configuration hand-off** layer.
+
+---
+
+## 3. Data Flow
+
+### Configuration Loading
+
+There is **no file/config persistence** here. Configuration is **intent-driven**:
+
+```
+Caller Activity / Service
+   │  putExtra("EMI", n)
+   │  putExtra("SerTy", type)
+   │  putExtra("ImeCap", bool)
+   │  putExtra("NoTr", bool)
+   │  startActivity(ActivityScreenCapture)
+   ▼
+ActivityScreenCapture.onCreate()
+   │  1. read extras → fields
+   │  2. build MediaProjection consent intent (API-gated)
+   │  3. launcher.a(consentIntent)  ──► system dialog
+   ▼
+[S U S P E N S I O N]  — user taps "Start now"
+   ▼
+Activity Result contract callback (C1751g / lambda h(24,this))
+   │  receives RESULT_OK: Intent data (the projection token)
+   │  receives RESULT_CANCELED
+   ▼
+Forward { data, EMI, SerTy, ImeCap, NoTr } to capture Service
+   (startForegroundService / bind — in the collapsed lambda body)
+```
+
+### Main Loop
+
+The "main loop" does **not** live in this class. This launcher's entire lifecycle is: *receive extras → request grant → hand off → finish*. The tick loop (screen grabs, `dispatchGesture`, image match) executes in the downstream `Service` (given `SerTy` selects the loop mode and `ImeCap` toggles input monitoring). The `ActivityC1875f` base likely provides a coroutine/Rx dispatcher used by that service, since the activity itself performs no looping.
+
+---
+
+## 4. API Usage
+
+### Android Platform APIs
+
+| API | Usage |
+|-----|-------|
+| `MediaProjectionManager` (`getSystemService("media_projection")`) | Obtain the projection service handle. |
+| `createScreenCaptureIntent()` | API ≤ 33: request full-screen capture consent. |
+| `createScreenCaptureIntent(MediaProjectionConfig)` | API ≥ 34: per-display consent with the new restricted model. |
+| `MediaProjectionConfig.createConfigForDefaultDisplay()` | Restricts capture to the default display (API 34+). |
+| `Build.VERSION.SDK_INT` | Version gate for the two consent paths. |
+| `Intent.getIntExtra / getBooleanExtra / hasExtra` | Optional config parsing (`EMI`, `SerTy`, `ImeCap`, `NoTr`). |
+| `Toast.makeText` + `R.string.oz` | User-facing error on failure. |
+| `Activity.getSystemService`, `finish()` | Lifecycle. |
+
+### App-Framework APIs
+
+| API | Usage |
+|-----|-------|
+| `g.ActivityC1875f` base class | App-specific activity with shared plumbing (permissions, theme, dispatchers). |
+| `C1751g` (`registerForActivityResult` wrapper) | Typed launcher; `.a(intent)` fires the contract. |
+| `C1802c` | `ActivityResultContract` implementation (≈ `StartActivityForResult`). |
+| `E(contract, callback)` | Registration call; `h(24, this)` is the compiler-generated result callback. |
+
+**Notably absent**: no `AccessibilityService`, no `dispatchGesture`, no `ImageGrab`/`PixelCopy`, no `Bitmap` handling. Those are the *consumer* side of the `MediaProjection` token produced here. This is a top-down design: **consent → token → service**, keeping the privileged grant out of the UI layer.
+
+---
+
+## 5. Logic Flow (Step by Step)
+
+1. **Entry** — caller starts `ActivityScreenCapture` with optional extras identifying target display (`EMI`), service mode (`SerTy`), IME monitoring (`ImeCap`), and telemetry suppression (`NoTr`).
+2. **`super.onCreate`** — base activity initializes framework/theme.
+3. **Read extras** — populate `f17057G/H/I/J`; absent extras default to `0/false`.
+4. **`getSystemService("media_projection")`** — cast to `MediaProjectionManager`.
+5. **Version branch**:
+   - **< 34**: `createScreenCaptureIntent()` → wrap in launcher.
+   - **≥ 34**: `createConfigForDefaultDisplay()` → `createScreenCaptureIntent(config)` → wrap in launcher.
+6. **`f17060K.a(intent)`** — triggers the system consent dialog; activity suspends.
+7. **User decision** → result contract `C1751g`/`h(24,this)` fires:
+   - **RESULT_OK**: the callback (in the collapsed lambda) extracts the returned `Intent` (the `MediaProjection` token), attaches the preserved extras (`EMI`, `SerTy`, `ImeCap`, `NoTr`), and starts/forwards to the capture foreground service. That service then:
+     - creates a `VirtualDisplay` + `ImageReader` on the display identified by `EMI`,
+     - runs its capture loop (matching vs. OCR per `SerTy`),
+     - optionally mounts an IME/accessibility input channel if `ImeCap`,
+     - suppresses overlay/telemetry if `NoTr`.
+   - **RESULT_CANCELED**: callback (not shown in this file) typically finishes without starting the service; user denies capture.
+8. **Exception path** — any throw during steps 4–6 (e.g., `IllegalStateException` from a concurrent projection, `SecurityException`) → toast `R.string.oz`, `finish()`.
+9. **Activity ends** — this launcher becomes a **transient bridge**; the persistent macro engine lives in the downstream Service.
+
+---
+
+### Summary
+
+`ActivityScreenCapture` is a **deliberately minimal, API-34-aware consent shim**. It is the security boundary between untrusted app logic and the OS-level `MediaProjection` grant. Its design — intent-carried config, version-gated capture intent, Activity Result contract, and immediate hand-off to a service — reflects a mature macro-automation architecture in which **screen reading and gesture injection are decoupled from permission acquisition**, and where Android 14's stricter per-session projection model has been explicitly accommodated.

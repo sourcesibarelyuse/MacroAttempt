@@ -1,0 +1,67 @@
+# Generic Engine Blueprint
+
+```
+GLOBAL singleton_handle = null
+GLOBAL listeners = []
+
+### Lifecycle / Config Wiring
+ON service_connected:
+    singleton_handle = self
+ON rebind(intent):
+    singleton_handle = self
+ON accessibility_event(ev):
+    discard (no state detection here)
+ON interrupt:
+    noop
+
+### Shutdown Paths
+FUNCTION stop_self():
+    IF singleton_handle exists AND sdk >= 24:
+        try: singleton_handle.disable_self()
+        catch: ignore
+    notify_listeners(enabled = false)
+
+FUNCTION notify_listeners(enabled):
+    singleton_handle = null
+    FOR each listener in listeners:
+        listener.callback(enabled)   # allows observers to react to engine state
+
+ON unbind(intent):
+    notify_listeners(false)
+    return true                  # rebind allowed
+
+ON destroy():
+    notify_listeners(true)       # "destroyed" vs "disabled" flag
+    super.destroy()
+
+### Input Injection
+The engine does NOT inject events directly here.
+It only registers itself as the AccessibilityService; all input
+injection (gestures/gesture dispatch) is expected to be performed
+by code holding `singleton_handle`, typically via
+dispatchGesture()/performGlobalAction() on that instance.
+=> Injection API surface = look up singleton_handle, then call
+   OS gesture dispatch.
+
+### State Detection
+Not implemented in this module. Detection of "is service alive"
+is done via:
+    alive = (singleton_handle != null)
+Lifecycle edges (connected/rebind/unbind/destroy) are broadcast to
+listeners so higher layers can start/stop their own timing loops.
+
+### Timing / Delay Loops
+Not present here. Pattern implied:
+    FOR listeners notified on state change:
+        listener decides whether to run/cancel its own
+        poll-or-sleep loop based on the boolean flag.
+```
+
+**Extracted engine primitives**
+- `singleton_handle` — global registry of the active service (injection gateway).
+- `listeners[]` — observer list for service up/down transitions.
+- `notify_listeners(flag)` — fan-out state broadcast + handle reset.
+- `stop_self()` — guarded self-disable with SDK check + fan-out.
+- Lifecycle hooks (connect/rebind/unbind/destroy) → state broadcasts only.
+- No config calibration, no OCR/state detection, no loop timing in this file
+  (delegated to observers / callers).

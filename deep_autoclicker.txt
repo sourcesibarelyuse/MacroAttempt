@@ -1,0 +1,186 @@
+# Technical Reverse-Engineering Report: `AutoClickAccessibilityService`
+
+## 1. Core Architecture
+
+### Primary Class
+`AutoClickAccessibilityService extends android.accessibilityservice.AccessibilityService`
+
+This is the central **Android AccessibilityService** — the privileged system-level component Android grants to apps that assist users with disabilities. The app abuses this API (a common pattern for auto-clickers/macro tools) to inject touch gestures programmatically into *any* app, without root.
+
+### Members / Nested Classes
+
+| Element | Role |
+|---|---|
+| `O000O0O00OO0O0OOO0O` (Runnable) | UI/screen-watcher; polls screen state every ~1s (recursive `postDelayed`), updates a `TextView` (countdown / time display) |
+| `O000O0O00OO0O0OOOO0` (Runnable) | Timer/countdown updater; reads `System.currentTimeMillis()`, formats via `O000OO00OOO0O0OO0O0.O000O0O0O0OOOO0O00O(long)`; thresholds at 90000ms |
+| `O000O0O00OO0OO0O0OO` (BroadcastReceiver) | Receives control intents (start/stop/pause/etc.). Contains obfuscated string constants for command actions |
+| `O000O0O00OO0OO0OO0O` (GestureResultCallback) | **Wraps `AccessibilityService.GestureResultCallback`** — delegate pattern. On `onCompleted` resets flags & dispatches next gesture in a chain; on `onCancelled` handles retries/errors |
+| `O000O0O00OO0O0OOO0O` inner Runnable | Config add/remove click handlers (list UI) |
+
+### Design Patterns
+- **Singleton-ish service registration**: static `f16222...Service` holds the live instance; `f16219...` etc. are global runtime flags (`ON`, `RUNNING`, `PAUSED`).
+- **Delegate/Wrapper**: The custom `GestureResultCallback` subclass wraps an external callback (`f16258...O`), forwarding `onCompleted`/`onCancelled` and tracking state.
+- **Runnable-as-state-machine**: The nested `Runnable` classes re-post themselves via `Handler.postDelayed` (typical polling loop), and mutate static counters/flags.
+- **Heavy obfuscation**: Strings encoded with unicode + a decoder `O000O0OO0OOO0O0O0O0.O000O0O00OO0O0OOO0O.O000O0O00OO0O0OOO0O(long)` (constant-folding decompiler). Control flow flattened into `while(true){switch(string.hashCode()^...)}` — the signature of a string-obfuscating/enfuscator such as `StringFog` or `DexGuard`/`Bangcle`. Many methods intentionally replaced with `UnsupportedOperationException` in this decompile (the disassembler bailed).
+
+---
+
+## 2. Key Methods
+
+### Gesture Injection
+- **`O000O0O0O0O0OO0O0OO(List<Path>, GestureResultCallback)`** — The core multi-stroke gesture dispatcher:
+  - Builds a `GestureDescription.Builder`;
+  - Iterates `Path` list, `addStroke(new StrokeDescription(path, 0, 10))` — **duration fixed at 10ms** (fast tap/swipe);
+  - Calls `this.f16239...O.O000O0O00OO0O0OOOO0(gestureResultCallback)` to attach delegate;
+  - `dispatchGesture(builder.build(), delegate, null)` — **the real injection call**.
+  
+- **`O000O0O0O0O0O0OOO0O(int x, int y, int duration, GestureResultCallback)`** — single-point tap/swipe; builds a `Path`, dispatches with duration.
+
+- **`O000O0O0O0O0O0OOOO0(Path, int strokeTime, PointInfo, GestureResultCallback)`** — single-stroke dispatcher with error handling:
+  - Validates path non-empty (`path.isEmpty()`), rejects if strokeTime ≤ 0;
+  - `GestureDescription.Builder.addStroke(new StrokeDescription(path, 0L, strokeTime))`;
+  - `dispatchGesture(...)`; on exception logs, calls `onCancelled(null)`, shows toast `R.string.invalid_gesture`.
+
+- **`O000O0O0O0O0OO0OO0O(MultLineGestureInfo, GestureResultCallback)`** — Multi-line/multi-finger gesture. Iterates `GestureLineInfo` list, computes relative timestamps (`getDownTouchTime()`/`getUpTouchTime()`), adds strokes with their own start offsets. Catches `IllegalStateException` for max stroke count (`GestureDescription.getMaxStrokeCount()`) and max duration (`getMaxGestureDuration()`), showing error toasts.
+
+- **`O000O0O0O0O0OO0OOO0(Path p1, long d1, Path p2, long d2, long duration, cb)`** — Two-path (two-finger) gesture dispatch (pinch etc.).
+
+### State Detection / Input Reading
+- **`onAccessibilityEvent(AccessibilityEvent)`** — The heart of "state detection". Given an `AccessibilityEvent`:
+  - Gets `event.getPackageName()`, `event.getClassName()`, root node via `getRootInActiveWindow()`;
+  - Maintains a `Map<String,Boolean> f16238...` cache keyed by package/class (clears when >100 entries) to dedupe;
+  - Calls into obfuscated handlers (`com.ksxkq.autoclick.auto.O000O0O00OO0OOO0OO0`) which analyze UI text/nodes to detect screen state (e.g. "is this the target game/screen?");
+  - Uses `O000OO00OOO0O0OO0O0.O000O0O0O0OO00OO0OO(CharSequence)` to test if a text/class is significant (non-empty, contains keywords);
+  - Tracks `f16224...`, `f16225...` static strings for current package/class.
+
+- **`O000O0O0O00OOO0O0OO()`** — Resolves the **current foreground app**: queries `getContentResolver()` with `Settings.Secure.getString(...)` (which under the hood often reads usages stats / a system setting), extracts package name. Also has `O000O0O0O00OOO0OO0O()` which uses `Intent(CATEGORY_HOME)` + `PackageManager.resolveActivity` to get the launcher/home package (detecting whether user left to home screen).
+
+### Config / Flow Control
+- **`O000O0O0O00OOOO0O0O()`** (large) — Loads `ConfigInfo` objects from the database (`com.ksxkq.autoclick.db.O000O0O00OO0O0OOOO0`) and drives the macro loop.
+- **`O000O0O0O00OO0OOOO0()`** — Start/execute logic; enables running flags.
+- **`onServiceConnected()`** — Init: sets static instance, sets `f16219...=true`, builds `AccessibilityServiceInfo` (`flags=82` = `FLAG_INCLUDE_NOT_IMPORTANT_VIEWS | FLAG_REPORT_VIEW_IDS | FLAG_REQUEST_ENHANCED_WEB_ACCESSIBILITY`, `eventTypes=12323` = all relevant), `notificationTimeout=100`, `feedbackType=-1`; calls `setServiceInfo`; starts a `Handler` posting a delayed runnable (1s) for the watcher loop.
+- **`onDestroy()`** — Teardown: clears static instance, unregisters receivers, cancels alarm, resets counters, calls ad/util cleanup.
+- **`O000O0O00OOOO0O0OO0(String)`** → **`O000O0O0O00OO0OOO0O(String)`** — The main gesture execution routine (huge, bailed out), likely converting a stored config (points/gestures) into actual `dispatchGesture` calls.
+- **`O000O0O00OO0O0OOO0(AutoClickAccessibilityService)`** — Reflection-based init: `Class.forName(...)`, iterates declared `String`-typed fields, sets them to a decoded value to reset internal string state (anti-tamper/obfuscation self-check).
+
+---
+
+## 3. Data Flow
+
+```
+[Config source: SQLite DB via O000O0O00OO0O0OOOO0]
+        │
+        ▼
+ConfigInfo objects (bean: points, gestures, MultLineGestureInfo,
+               GestureLineInfo with down/up touch times)
+        │
+        ▼
+O000O0O00OOOO0O0OO0(String key)  → looks up config by key
+        │
+        ▼
+O000O0O0O00OO0OOO0O(...)  → builds Paths/Strokes
+        │
+        ▼
+Path / GestureDescription.Builder → dispatchGesture()
+        │
+        ▼
+GestureResultCallback (delegate) → onCompleted/onCancelled
+        │  (on success: schedule next action via Handler; on failure: retry/toast)
+        ▼
+Next iteration (Runnable re-posts via Handler.postDelayed ~1s)
+```
+
+**Config loading:** Configs are persisted in Room/SQLite (`db.O000O0O00OO0O0OOOO0`). Each `ConfigInfo` is identified by `getKey()` and holds trigger targets and gesture definitions (`PointInfo`, `MultLineGestureInfo`, `GestureLineInfo`).
+
+**Main loop:** There is no explicit `while` loop blocking; instead it's **event-driven + Handler-based**:
+- The watcher `Runnable` polls every 1s.
+- A `BroadcastReceiver` reacts to start/stop intents.
+- `onAccessibilityEvent` fires on UI changes and runs detection.
+- `GestureResultCallback.onCompleted` kicks off the next scheduled gesture. `AlarmManager.AlarmReceiver` provides periodic wakeups.
+
+---
+
+## 4. API Usage
+
+### Android APIs
+
+| API | Where | Purpose |
+|---|---|---|
+| `AccessibilityService` | base class | System-level accessibility hook |
+| `AccessibilityServiceInfo` | `onServiceConnected` | Declares `flags=82`, `eventTypes=12323`, `feedbackType=-1`, `notificationTimeout=100` |
+| `setServiceInfo()` | `onServiceConnected` | Applies info dynamically |
+| `getRootInActiveWindow()` | `onAccessibilityEvent` | Read foreground UI node tree |
+| `AccessibilityEvent.getPackageName()/getClassName()/getEventType()` | `onAccessibilityEvent` | Screen/state detection |
+| **`dispatchGesture(GestureDescription, GestureResultCallback, Handler)`** | core injection methods | **The actual touch injection mechanism** |
+| `GestureDescription.Builder.addStroke(StrokeDescription(path, startTimeMs, durationMs))` | all gesture methods | Defines strokes; duration 10ms for taps |
+| `GestureDescription.StrokeDescription` | same | Individual stroke (path + timing) |
+| `GestureDescription.getMaxStrokeCount()` / `getMaxGestureDuration()` | multi-line method | Validation limits |
+| `GestureResultCallback.onCompleted/onCancelled` | delegate wrapper | Async completion handling |
+| `BroadcastReceiver` | nested | React to control intents |
+| `AlarmManager.AlarmReceiver` | field | Periodic scheduling |
+| `Handler.postDelayed` | Runnables/onServiceConnected | Polling loop timing |
+| `Settings.Secure.getString` | foreground app detection | Resolves current app/setting |
+| `PackageManager.resolveActivity` + `Intent(ACTION_MAIN, CATEGORY_HOME)` | foreground detection | Detects if home screen is active |
+| `Path`/`Path.isEmpty()` | gesture building | Defines pixel geometry |
+| `SystemClock.uptimeMillis()` | timing injection | Absolute timestamps |
+| `TextUtils.isEmpty/equals` | obfuscated branching | String checks |
+| `Class.forName` + reflection `getDeclaredFields`/`setAccessible` | `O000O0O00OO0OO0OOO0(...)` | Anti-tamper/field reset |
+| `registerReceiver`/`unregisterReceiver` | lifecycle | Broadcast setup/teardown |
+
+### Notable flags
+- `flags = 82` (0x52) = `FLAG_INCLUDE_NOT_IMPORTANT_VIEWS(0x2) | FLAG_REPORT_VIEW_IDS(0x10) | FLAG_REQUEST_ENHANCED_WEB_ACCESSIBILITY(0x40)` — 0x02+0x10+0x40 = 0x52. Enables reading web content and view IDs, needed to detect in-app elements.
+- `eventTypes = 12323` (0x3023) = combination of `TYPE_VIEW_CLICKED|TYPE_VIEW_LONG_CLICKED|TYPE_WINDOW_STATE_CHANGED|TYPE_VIEW_FOCUSED|...` — listens broadly for UI state changes.
+
+### PC notes
+This is a **pure Android** source (no `ImageGrab`, no `pyautogui`). But the conceptual analogues are:
+- Screen capture / "state detection" ≙ `AccessibilityNodeInfo` tree traversal (not pixels).
+- Input injection ≙ `dispatchGesture` (not `SendInput`).
+
+---
+
+## 5. Automation Logic Flow (step-by-step)
+
+1. **Service init** (`onServiceConnected`)
+   - Register singleton `f16222...`.
+   - Set running flag `f16219...=true`.
+   - Configure & register `AccessibilityServiceInfo` (broad event types, web accessibility).
+   - Create gesture-result delegate `O000O0O00OO0OO0OO0O`.
+   - Post 1s-delayed watcher `Runnable` on a `Handler`.
+
+2. **Event listening** (`onAccessibilityEvent`)
+   - On `TYPE_WINDOW_STATE_CHANGED` (eventType 32) or other UI events, capture `package`, `class`.
+   - Read root `AccessibilityNodeInfo`, walk children (text from `TextView`s).
+   - Dedupe via `f16238` map; detect current screen via obfuscated `auto.O000O0O00OO0OOO0OO0` classifier.
+   - Cache/compare against current target config's expected screen/package.
+
+3. **Foreground detection** (`O000O0O0O00OOO0OO0O`/`O000O0O0O00OOO0O0OO`)
+   - Read current package via `Settings.Secure.getString` or `resolveActivity`; if the target app is foreground → proceed; if home screen → skip/pause.
+
+4. **Load configs** (`O000O0O0O00OOOO0O0O` / `O000O0O00OOOO0O0OO0`)
+   - Query DB for stored `ConfigInfo` list.
+   - Resolve the config matching current screen/package.
+
+5. **Build gesture**
+   - For each config action: construct `Path` (tap point, or multi-point swipe), or use stored `MultLineGestureInfo`/`GestureLineInfo` (absolute down/up times).
+   - Create `GestureDescription.Builder`; add strokes with `StrokeDescription(path, startOffset, duration)`.
+     - Taps: duration = 10ms, start = 0.
+     - Multi-line: start = `getDownTouchTime() - baseline`, duration = `up - down`.
+
+6. **Inject**
+   - `dispatchGesture(builder.build(), f16239...delegate, null)`.
+   - Delegate wraps the real callback (`gestureResultCallback`).
+
+7. **Completion handling** (`O000O0O00OO0OO0OO0O.onCompleted`)
+   - Reset the "in progress" flag via `O000O0O00OOO0O0OOO0(false)` / `O000O0O00OO0OOOO0O0(false)`.
+   - Forward `onCompleted` to the stored external callback.
+   - Chain next scheduled action after 1s (Handler) or per-config delay.
+
+8. **Cancellation** (`onCancelled`)
+   - Retry logic / error toast (`R.string.invalid_gesture`).
+   - Possibly re-dispatch (inferred from the huge bailed method).
+
+9. **Loop / stop**
+   - `AlarmManager` or `BroadcastReceiver` (`onReceive`) starts/stops runs.
+   - Flags `f16219/f16220/f16221` control RUNNING/PAUSED/STOP; `onDestroy` tears down receivers and alarms.
+
+This is a classic **"Accessibility auto-clicker"**: state detection via the accessibility node tree + timing via Handler/AlarmManager + injection via `dispatchGesture`, with obfuscated strings and flow to resist analysis, wrapped in a config-driven (Room DB) execution engine.

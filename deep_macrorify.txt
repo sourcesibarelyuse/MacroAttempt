@@ -1,0 +1,202 @@
+# Technical Reverse-Engineering Report
+
+## Analysis of `EMMAccessibility` — `com.kok_emm.mobile.core.service`
+
+---
+
+## 1. Core Architecture
+
+### 1.1 Class Hierarchy
+
+```
+android.accessibilityservice.AccessibilityService
+        └── com.kok_emm.mobile.core.service.EMMAccessibility
+```
+
+`EMMAccessibility` is a **singleton AccessibilityService** — the standard Android pattern for a privileged system-service connection that can observe UI events and (with `dispatchGesture`) inject touch input.
+
+### 1.2 Members
+
+| Member | Type | Purpose |
+|---|---|---|
+| `f17063h` | `static volatile EMMAccessibility` | Double-checked-locking singleton reference to the **active** service instance. `volatile` is required because it's read/written across threads and lifecycle callbacks. |
+| `f17064i` | `static final ArrayList` | **Observer list** — registered callback objects (`J3.a` interface implementations) that want to be notified on service connect/disconnect. |
+| `a()` | static | "Shutdown request" — asks the active service to `disableSelf()`. |
+| `b(boolean)` | static | "Teardown/notify" — nulls the singleton and fans out a callback to all observers. |
+
+### 1.3 Design Patterns
+
+- **Singleton (volatile field)** — `f17063h` guarantees exactly one service handle is visible globally.
+- **Observer / Listener** — `f17064i` holds `J3.a` listeners; `b()` iterates and calls `.a(boolean)`. (The `J3.a` package name is obfuscated — likely `interface a { void a(boolean connected); }`.)
+- **Static façade for lifecycle control** — `a()` and `b()` are the only public API; they are intended to be called from elsewhere (Activity/Application layer) to drive the service.
+
+### 1.4 Inheritance contract
+
+`AccessibilityService` requires implementing `onAccessibilityEvent`, `onInterrupt`, and (optionally) `onServiceConnected`. All are stubbed or used only to refresh the singleton — **no actual event handling logic exists here**. This is purely a *lifespan broker*: the heavy automation work lives elsewhere and reaches the service through `f17063h`.
+
+---
+
+## 2. Key Methods
+
+### 2.1 `public static void a()`
+
+```java
+EMMAccessibility s = f17063h;
+if (s == null || Build.VERSION.SDK_INT < 24) return;
+try { s.disableSelf(); } catch (Exception unused) {}
+b(false);
+```
+
+**Purpose:** Gracefully disable the accessibility service from application code.
+
+- **Guard:** Requires an active instance *and* API ≥ 24 (Nougat), because `AccessibilityService.disableSelf()` was introduced in API 24. On older devices this method is a **silent no-op** (note the `return` — it never even calls `b(false)`).
+- **Exception swallowed:** Disabling can throw if the service is already dying; failure is intentionally ignored to make shutdown idempotent.
+- **Notify observers:** Calls `b(false)` — flag `false` means "not/was not connected".
+
+### 2.2 `public static void b(boolean z9)`
+
+```java
+f17063h = null;
+Iterator it = f17064i.iterator();
+while (it.hasNext()) ((J3.a) it.next()).a(z9);
+```
+
+**Purpose:** Central teardown / broadcast.
+
+- **Clears the singleton** unconditionally (so no stale handle survives).
+- **Fans out** the boolean to every listener. The boolean meaning is inferred from call sites — see §5.1:
+  - called from `a()` with `false`,
+  - called from `onUnbind` with `false`,
+  - called from `onDestroy` with `true`.
+
+> ⚠️ **Race condition:** `b()` can be invoked concurrently from `onDestroy` and `onUnbind` (both run on the main thread in practice, so mostly safe, but `f17064i` is a raw `ArrayList` — **not** a `CopyOnWriteArrayList` — so concurrent registration while an iteration is in progress would throw `ConcurrentModificationException`).
+
+### 2.3 Lifecycle callbacks
+
+| Callback | Behavior |
+|---|---|
+| `onCreate()` | `getApplicationContext()` called but **return value discarded** — dead code, likely leftover from a decompiler artifact or removed logging. |
+| `onServiceConnected()` | `f17063h = this;` ✅ registers the singleton. This is the "we are live" moment. |
+| `onRebind(Intent)` | `f17063h = this;` ✅ re-registers after a bind. |
+| `onUnbind(Intent)` | Calls `b(false)` and **returns `true`** — requests that `onRebind` be called on a future bind. |
+| `onDestroy()` | Calls `b(true)`, then `super.onDestroy()`. |
+| `onAccessibilityEvent(ev)` | **Empty** — the service does not observe UI events. |
+| `onInterrupt()` | Only `getApplicationContext()` (dead call). |
+
+---
+
+## 3. Data Flow
+
+```
+        ┌──────────────────────────────────────────────────┐
+        │  Android OS  (AccessibilityManager)              │
+        │  binds service when user enables it in Settings  │
+        └───────────────────────┬──────────────────────────┘
+                                │
+                    onServiceConnected()
+                                │
+                    f17063h = this   ← singleton set
+                                │
+        ┌───────────────────────▼──────────────────────────┐
+        │  Other app code can now reach the service via    │
+        │  EMMAccessibility.f17063h (getter is absent —    │
+        │  field is package-private / no accessor!)        │
+        └───────────────────────┬──────────────────────────┘
+                                │
+                    ┌───────────┴────────────┐
+                    │                        │
+              (external call)          (user disables / OS unbinds)
+                    │                        │
+              a()  →  disableSelf()     onUnbind(false) / onDestroy()
+                    │                        │
+                    └──────────► b(flag) ◄───┘
+                                    │
+                    f17063h = null
+                    for each J3.a in f17064i:  listener.a(flag)
+```
+
+**Configuration loading:** *None in this file.* There is no `onServiceConnected` parsing of settings, no `SharedPreferences`, no file/JSON read. Any configuration must be loaded by consumers that register into `f17064i` **before** `onServiceConnected` fires (i.e., from `Application.onCreate` or an Activity). This class only *advertises* that the service is live.
+
+**Main loop:** *None.* `onAccessibilityEvent` is empty — this service does not process events, so there is no polling loop here. Whatever "main loop" the macro tool has must be driven by the registered `J3.a` listeners reacting to the connect/disconnect broadcast.
+
+---
+
+## 4. API Usage
+
+| API | Where | Notes |
+|---|---|---|
+| `AccessibilityService` | base class | Required for `dispatchGesture` / global action injection. This class **does not** call `dispatchGesture` itself — that would be done by the `J3.a` listeners holding the `f17063h` handle. |
+| `AccessibilityService.disableSelf()` | `a()` | API 24+. Graceful programmatic unbind. |
+| `AccessibilityService.onServiceConnected()` | lifecycle | Hook to publish the singleton. |
+| `AccessibilityService.onAccessibilityEvent()` | lifecycle | **Overridden empty** — explicitly opting out of event observation (privacy / performance). |
+| `AccessibilityEvent` | parameter type | Imported and used in signature only. |
+| `Build.VERSION.SDK_INT` | `a()` | API-level gate (`≥ 24`). |
+| `Service.onBind / onUnbind / onRebind` | lifecycle | Standard binding semantics; `onUnbind` returns `true` to enable rebind. |
+| `Context.getApplicationContext()` | every callback | Called but result unused — no-op (evidence of stripped logging / decompilation remnants). |
+| `Intent` | `onRebind` / `onUnbind` | Standard Service signatures. |
+| `java.util.Iterator` / `ArrayList` | observer storage | **Not thread-safe**; no synchronization except the `volatile` on the singleton. |
+
+**Notably absent:** no `dispatchGesture`, no `getWindows()`, no `performGlobalAction`, no `ImageReader`/`MediaProjection`, no `MediaProjection`, no `AccessibilityNodeInfo`. So this file is *not* where screen-capture or input injection occurs — it is only the **accessibility grant anchor**.
+
+---
+
+## 5. Logic Flow
+
+### 5.1 Lifecycle sequence
+
+**A. Service enabled by user (Settings → Accessibility):**
+1. OS instantiates `EMMAccessibility`, calls `onCreate()`.
+2. `onServiceConnected()` → `f17063h = this`. The app is now "armed".
+3. (Registered `J3.a` listeners were registered earlier; they are *not* notified at this point — only on disconnect.)
+
+**B. Application asks for shutdown:**
+1. Some UI/logic calls `EMMAccessibility.a()`.
+2. Guard: if `f17063h == null` → return (nothing to do).
+3. Guard: if `SDK_INT < 24` → return (cannot call `disableSelf`).
+4. `disableSelf()` invoked; exceptions swallowed.
+5. `b(false)` → singleton nulled → all listeners get `a(false)`.
+
+**C. Service torn down by OS / user:**
+- `onUnbind(intent)` → `b(false)` → listeners told "disconnected"; returns `true` so rebind is possible.
+- If instance is destroyed: `onDestroy()` → `b(true)` → listeners told "destroyed"; then `super.onDestroy()`.
+
+**D. Rebind path:**
+- `onRebind(intent)` → `f17063h = this` → service active again.
+
+### 5.2 Boolean semantics (inferred)
+
+| Call site | Value | Meaning |
+|---|---|---|
+| `onDestroy` → `b(true)` | `true` | "(Per)manently destroyed" |
+| `onUnbind` → `b(false)` | `false` | "Transiently disconnected" |
+| `a()` → `b(false)` | `false` | "Shutdown requested by app" |
+
+Because `b()` **nulls the singleton before notifying**, any listener that reacts by trying to use `EMMAccessibility.f17063h` will find `null`. This ordering is deliberate: it forces listeners to re-fetch/re-register rather than hold a stale handle.
+
+### 5.3 Step-by-step automation sequence (full system view)
+
+Since this file is only the anchor, the automation sequence supported by it is:
+
+1. **User enables** the accessibility service → `f17063h` set.
+2. **Consumer registers** a `J3.a` observer into `f17064i` (done elsewhere, likely from `Application`).
+3. **Consumer reaches** `EMMAccessibility.f17063h` to get the live `AccessibilityService` and performs its own `dispatchGesture` / window inspection.
+4. **On user disable / app exit:** `onUnbind` or `onDestroy` or `a()` fires → `b(flag)` → singleton cleared, listeners told (`a(true)` = destroyed / `a(false)` = disconnected).
+5. **On rebind:** `onRebind` restores the singleton; listeners are **not** re-notified (they must re-register or re-query externally).
+
+---
+
+## 6. Findings, Risks & Recommendations
+
+| # | Observation | Impact | Fix |
+|---|---|---|---|
+| 1 | `f17064i` is a plain `ArrayList` modified from possibly different threads while iterated in `b()` | `ConcurrentModificationException` / missed notification | Use `CopyOnWriteArrayList` or synchronize on the list. |
+| 2 | `f17063h` has no public getter | External code in another package cannot access the singleton | Add `public static EMMAccessibility getInstance()`. |
+| 3 | `getApplicationContext()` return value discarded in every callback | Dead code / wasted call | Remove; if used for logging, restore logging. |
+| 4 | `a()` early-returns on `SDK_INT < 24` **without** calling `b(false)` | Listeners never notified on pre-N devices | Move `b(false)` outside the guard (or handle separately). |
+| 5 | `onDestroy` uses `true`, `onUnbind`/`a()` use `false`, but boolean meaning undocumented | Ambiguous callback contract | Document/enum the state (`CONNECTED`, `DISCONNECTED`, `DESTROYED`). |
+| 6 | No listener notification on `onServiceConnected` / `onRebind` | Consumers can't react to "connected" from this class | Add `for (J3.a l : f17064i) l.a(true)` in connect path, or document that consumers poll `getInstance()`. |
+| 7 | `onUnbind` returns `true` (rebind requested) but `onRebind` only re-sets singleton, never notifies listeners | After rebind, listeners think app is disconnected | Notify listeners in `onRebind`. |
+| 8 | Empty `onAccessibilityEvent` while class extends `AccessibilityService` | Service subscription declared but unused | Keep empty (privacy) or remove accessibility event filter in config; ensure the service isn't wasting battery. |
+| 9 | Obfuscated names (`f17063h`, `J3.a`) | Maintainability | Deobfuscate in release mapping. |
+
+**Bottom line:** `EMMAccessibility` is a thin, **stateless-broker** accessibility service. It does **not** contain macro logic, screen capture, input injection, or configuration parsing — those are in the `J3.a` observers and the code that consumes `f17063h`. Its sole responsibilities are: (a) **hold the privileged service handle globally**, and (b) **broadcast connect/teardown state** to interested components, with a small API-24+ safety gate around `disableSelf()`.

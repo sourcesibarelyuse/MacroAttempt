@@ -1,0 +1,67 @@
+# Generic Macro Engine Blueprint (from `Screenshot` statement)
+
+```
+# === CONFIG / CALIBRATION HANDLING ===
+Struct StatementDefinition:
+    title, icon, summary, helpDoc, editLayout   # declarative metadata
+    requiresPermissions(context) -> Permission[]
+
+# Permissions resolve dynamically by platform capability/version;
+# called before execution init. Legacy vs modern path chosen by env flag.
+
+# === SERIALIZATION / PARAMETER BINDING ===
+S(decoder):
+    versionGate(minVersion)                    # conditionally bind fields
+    bind(displayId)                            # param/field slot
+    bind(targetPath)                           # output/config path
+    bind(varImageFile)                         # result var slot
+    # -> every field is an addressable, typed slot for runtime values
+
+# === STATE DETECTION ===
+# No explicit polling logic in file; state comes from platform:
+resolveState(context):
+    requestCapability()                        # e.g. MediaProjection token
+    onResult(intent) -> validate result:
+        if cancel  -> raise "canceled"
+        acquire    -> raise "acquire failed"
+        else       -> return handle
+
+# Abstract state machine (inferable):
+IDLE -> REQUEST_CAPABILITY -> (GRANTED | DENIED) -> RUNNING -> COMPLETE
+X(intent):  asynchronously handle platform activity result, never blocks
+
+# === ASYNC EXECUTION / HAND-OFF ===
+onIntentResult(context, intent):
+    code = intent.extra(RESULT_CODE)
+    if code != SUCCESS: throw
+    token = systemService(MEDIA_PROJECTION).getMediaProjection(code, resultIntent)
+    ctx.enqueueWorker( Worker(token, resolvePath(targetPath)) )
+    return async                              # caller keeps pending
+
+# === INPUT INJECTION (injection layer stub) ===
+# File only references injection via token handle passed to worker.
+# Generic pattern:
+Worker(handle, destination):
+    capture(handle) -> bytes
+    write(destination)
+    setVar(varImageFile, destination)
+    signalComplete()
+
+# === TIMING / DELAY LOOPS ===
+# None present. Completion is event/signal-driven (onComplete slot),
+# not polled or slept. Flows: enqueue -> worker -> signal -> next.
+
+# === VISITOR (introspection graph walk) ===
+visit(visitor):
+    visit(onComplete)      # outgoing completion edge
+    visit(displayId)       # edge to param source
+    ...                    # every slot is a node in the execution graph
+```
+
+**Extracted generic engine pieces:**
+1. **Declarative config** — field slots + permission resolver keyed on capability/version.
+2. **Version-gated binding** — only bind fields when runtime schema >= minimum.
+3. **Capability negotiation** — request → pass/fail → handle, via platform result intent.
+4. **Async non-blocking hand-off** — enqueue worker with resolved token+destination, return pending.
+5. **Result propagation** — worker writes to output slot & raises completion signal (no sleep loops).
+6. **Introspection graph** — every param/edge is a visitor-traversable node.

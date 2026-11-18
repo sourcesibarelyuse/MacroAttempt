@@ -1,0 +1,65 @@
+# Generic Macro Engine Blueprint (Pseudocode)
+
+```
+// ── CONFIG / CALIBRATION ─────────────────────────────
+class TouchAction:
+    fields: x0,y0,x1,y1, gestureType, speed, displayId   // bindable inputs
+    loadConfig():
+        read each field via binding layer (default if null)
+        validate required (throw if missing)
+        resolve displayId -> target Display (default primary)
+
+// ── STATE DETECTION (Decision base) ──────────────────
+class Decision:
+    evaluate(env) -> branch outcome (true/false) to drive flow
+
+// ── INPUT INJECTION ──────────────────────────────────
+class TouchExecutor(async):
+    buildGesture(strokes, displayId):
+        builder = GestureBuilder()
+        if api >= 30: builder.setDisplayId(displayId)
+        for stroke in strokes:
+            path = stroke.path            // from (x0,y0) -> (x1,y1)
+            startTime = stroke.startOffset
+            duration  = stroke.endTime - stroke.startOffset
+            builder.addStroke(Stroke(path, startTime, duration))
+        return builder.build()
+
+    run(service):
+        gesture = buildGesture(...)
+        callback = GestureCallback(
+            onCompleted -> resolve(TRUE)
+            onCancelled -> resolve(FALSE))
+        service.dispatchGesture(gesture, callback, handler)
+
+    // if no accessibility gesture available, fall back to
+    // raw MotionEvent injection via InputManager (down/move/up loop)
+
+// ── TIMING / DELAY LOOPS ─────────────────────────────
+    speedToDuration(speed, distance):
+        // clamp speed, duration = distance / speed (bounded min/max)
+
+    waitLoop(condition):
+        while not condition():
+            sleep(pollInterval)          // SystemClock-based
+            if elapsed > timeout: abort
+
+// ── DISPLAY METRICS ──────────────────────────────────
+    getMetrics(display):
+        metrics = WindowManager.getDisplayMetrics(display)
+        return size + density   // used to scale/normalize coords
+
+// ── TASK LIFECYCLE (AsyncStatement) ──────────────────
+    onStart(service): launch run() off main thread
+    onResult(boolean): report TRUE/FALSE to flow, then yield
+```
+
+**Extracted generic pieces only:**
+- **Config:** bindable field resolution + required-arg validation + display selection.
+- **Gesture model:** stroke = (path, startOffset, duration); builder with API-gated displayId.
+- **Injection:** accessibility `dispatchGesture` with success/cancel callback → boolean result; MotionEvent fallback.
+- **Timing:** speed→duration conversion, polled wait loop with timeout.
+- **Metrics:** display metrics retrieval for coordinate scaling.
+- **Async contract:** start → build/dispatch → boolean resolution → yield to flow engine.
+
+DPRK-specific coordinates, webhooks, OCR inventory, and game names intentionally dropped.

@@ -1,0 +1,257 @@
+# Technical Analysis Report: `InteractTouch` Statement (Automate Android Automation Framework)
+
+## 1. Core Architecture
+
+### Main Class
+`InteractTouch` is a **final concrete statement** within the Automate (LlamaLab) automation framework. Its role is to synthesize touch gestures (taps, long-presses, swipes, pins, two-finger gestures) and inject them into the Android input subsystem.
+
+### Class Hierarchy
+```
+Decision (extends) → InteractTouch
+AsyncStatement (implements)
+```
+
+It inherits from `Decision` (a branching-capable statement) and implements `AsyncStatement`, meaning its actual completion is decoupled from `s1()` — the statement returns a pending state and later resolves via `x0()`.
+
+### Design Patterns Used
+- **Strategy Pattern**: For handling different gesture types (tap, long-press, swipe, pin). The `gesture` integer argument selects one of six branches (cases 1–6) in `s1()`.
+- **Template Method**: `AbstractStatement` provides `S()`, `a()`, `y0()`, `L1()`, `M0()` lifecycle hooks that subclasses extend for serialization, visitor traversal, and UI.
+- **Builder Pattern**: `GestureDescription.Builder` is used to construct the gesture to be dispatched.
+- **Command/Callback Pattern**: `GestureResultCallback` (`C0174a`) is registered with the Android AccessibilityService to receive `onCompleted`/`onCancelled` notifications.
+
+### Inner Classes
+| Class | Purpose |
+|-------|---------|
+| `InteractTouch.a` | Wraps a `GestureDescription`, dispatches it via `AccessibilityService.dispatchGesture()` (API 24+). Inner class `C0174a` = `GestureResultCallback`. |
+| `InteractTouch.b` | **Fallback path** for pre-API-24 devices. Simulates gestures manually using `MotionEvent` injection through `PathMeasure` sampling, dispatched via `Handle`/`ServiceChannel` (`s3.l`). |
+| `InteractTouch.c` | Value object: `{Path path, long startTime, long endTime}` — a single "stroke" in a multi-finger gesture. |
+
+### Fields (Configurable Arguments)
+Each is an `InterfaceC1675v0` (a lazily-evaluated expression/value reference in Automate):
+| Field | Purpose |
+|-------|---------|
+| `gesture` | Gesture type enum (1=TAP, 2=LONG_PRESS, 3=DOUBLE_TAP, 4=SWIPE, 5=PINCH_IN, 6=PINCH_OUT) |
+| `displayId` | Target display (API 30+ only — gated by `SDK_INT >= 30`) |
+| `x0, y0` | Start coordinates (percent, converted to pixels) |
+| `x1, y1` | End coordinates (for swipe/pinch) |
+| `speed` | Pixels-per-second for swipe; default 250 or 1000 px/sec depending on gesture |
+
+---
+
+## 2. Key Methods
+
+### 2.1 `s1(C1683x0)` — Gesture Construction (Main Entry Point)
+This is the **most important method**. It reads the `gesture` enum argument and dispatches to one of six builders, producing a `c[]` (array of strokes):
+
+- **Case 1 (TAP)**: `y(cVar, displayId, tapTimeout/2)` — a zero-length path held for `ViewConfiguration.getTapTimeout()/2` ms.
+- **Case 2 (LONG_PRESS)**: `y(cVar, displayId, getLongPressTimeout() + 50)` — same point, held for the long-press duration.
+- **Case 3 (DOUBLE_TAP)**: Two taps at the same point with a gap derived from `getDoubleTapTimeout()/2 + tapTimeout/2`.
+- **Case 4 (SWIPE)**: Builds a single line path `F(p0, p1)`, computes duration via `B(path, density, speed)`.
+- **Case 5 (PINCH_IN)**: `A(cVar, displayId, false)` — two symmetric strokes converging at midpoint.
+- **Case 6 (PINCH_OUT)**: `A(cVar, displayId, true)` — two strokes diverging from midpoint.
+
+Then, **based on API level**:
+```java
+if (24 <= Build.VERSION.SDK_INT) {
+    x0.y(new a(strokes, displayId));  // Native dispatchGesture
+} else {
+    b b = new b(strokes);
+    x0.y(b); b.n2(true);              // Manual MotionEvent injection
+}
+```
+Returns `false` (async — completion deferred).
+
+### 2.2 `A(...)` — Pinch Gesture Builder
+```java
+PointF C7 = C(..., x0, y0, 0); E(C7, screenPoint);  // %→pixel
+PointF C8 = C(..., x1, y1, 1); E(C8, screenPoint);
+PointF mid = avg(C7, C8);
+Path path1 = pinchOut ? F(C7, mid) : F(mid, C7);   // direction matters
+Path path2 = pinchOut ? F(C8, mid) : F(mid, C8);
+long dur = B(path1, density, speed);               // duration from length
+return { new c(path1, 0, dur), new c(path2, 0, dur) };
+```
+Purely geometric — creates two symmetric strokes (2-finger gesture). `speed` default is `250`.
+
+### 2.3 `B(Path, density, speed)` — Duration Calculator
+```java
+float length = new PathMeasure(path, false).getLength();
+long j = (long)((length / (speed * density)) * 1000);  // ms
+if (j <= 0) throw IllegalArgumentException("speed");
+```
+Converts path length in pixels into a millisecond duration using `speed` (screen-space px/sec scaled by density).
+
+### 2.4 `C(cVar, xField, yField, argNum)` — Coordinate Resolution
+Reads percent values (0.0–1.0, clamped), throws `RequiredArgumentNullException` if missing.
+
+### 2.5 `D(Context, displayId, Point, DisplayMetrics)` — Display Resolution
+**API-branching**:
+- **API ≥ 17**: `DisplayManager.getDisplay(displayId)` via `J.a.k(...)`
+- **API < 17**: `WindowManager.getDefaultDisplay()`
+Populates `point` (real size via `C2376a.f`) and optionally `DisplayMetrics`.
+
+### 2.6 `InteractTouch.a` — Native dispatch (API 24+)
+```java
+GestureDescription.Builder b = new GestureDescription.Builder();
+if (Build.VERSION.SDK_INT >= 30) b.setDisplayId(displayId);  // multi-display
+for (c stroke : strokes)
+    b.addStroke(new StrokeDescription(path, startTime, duration- startTime));
+this.f16682N1 = b.build();
+```
+`T1(AutomateAccessibilityService)` calls `dispatchGesture(this.gesture, callback, handler)`. Result is reported by `onCompleted` → `q2(TRUE)` or `onCancelled` → `q2(FALSE)`.
+
+### 2.7 `InteractTouch.b` — Manual MotionEvent synthesis (pre-API-24)
+This is the **most complex** class. It is used **only when `SDK_INT < 24`** because `dispatchGesture` didn't exist.
+
+**Key state fields:**
+- `PointerCoords[]/PointerProperties[]` — reusable buffers for MotionEvent
+- `U1` — current active pointer count
+- `f16691S1` — gesture "downTime" (base time)
+- `f16692T1` — last processed timestamp
+- `f16693V1` — pointer-ID counter
+
+**`run()` / `v2(...)` — ticker.** Scheduled via `postDelayed`. On each tick, calls `z2(now, elapsed)`.
+
+**`z2(j8, j9)` — main event generator.** Loops to determine next "event boundary":
+- Any stroke ending in `[lastT, now]` → candidate `i10`
+- Any stroke starting in `[lastT, now]` → candidate `i8`
+
+If a stroke ends: emits `ACTION_POINTER_UP` (mask 6) or `ACTION_UP` (mask 1 if last pointer), decrements `U1`, and sets pressure=0 for that pointer. If a stroke starts: `x2()` adds it. Then emits `ACTION_MOVE` (mask 2). Finally, computes next wake-up time and re-posts `run()` (capped at 100 ms).
+
+**`x2(i8, j8, j9)` — pointer-down.** Creates a new `a` (pointer wrapper) with next `id`. Emits first pointer as `ACTION_DOWN` (mask 0, pointer index -1).
+
+**`y2(downTime, eventTime, action, pointerIndex, force)` — emit MotionEvent.**
+```java
+for each active pointer:
+    interp = (eventTime - startTime) / (endTime - startTime)   // [0..1]
+    PathMeasure.getPosTan(interp * length, xy, null)
+    if (xy != lastXY || force)
+        needEmit = true
+if (needEmit) {
+    MotionEvent ev = MotionEvent.obtain(downTime, eventTime, action | (index<<8),
+        U1, props, coords, 0, 0, 1, 1, 0, 0, 4098 /*FLAG_HIDDEN?/ INJECTED*/, 0);
+    // dispatch via s3.l (likely an invocation/reflection bridge to InputManager.injectInputEvent)
+    obtain.recycle();
+}
+```
+Note flag `4098` = `0x1002` = `FLAG_WINDOW_IS_OBSCURED | ...` (context-dependent, likely an internal injection flag).
+
+### 2.8 `y0(Q3.c)` / `S(Q3.d)` / `a(Visitor)` — Serialization
+- `y0` (read) / `S` (write) / `a` (visit) all serialize the same 7 expression fields.
+- `displayId` is **version-gated**: only read `if (cVar.f6196x0 >= 101)` — i.e., backward-compatible with statements saved in older Automate versions (version code 101 introduced the `displayId` field).
+
+### 2.9 `M0(Context)` — Permission Declaration
+```java
+if (SDK_INT >= 24) return { AutomateAccessibilityService permission };
+else return { "com.llamalab.automate.permission.ACCESS_PRIVILEGED" };
+```
+`ACCESS_PRIVILEGED` indicates automations on pre-Nougat relied on a privileged/system-signed service with direct InputManager injection.
+
+### 2.10 `x0(...)` — Async completion
+Receives a `Boolean` result from the `GestureResultCallback`. Calls `o(ctx, success)` to finish the statement.
+
+---
+
+## 3. Data Flow
+
+### Configuration Loading
+1. **Deserialization**: `y0(Q3.c)` reads each field via `cVar.readObject()`, producing `InterfaceC1675v0` expression handles. The order is fixed; `displayId` is conditionally read based on version `f6196x0 >= 101`.
+2. **At execution time**, each `InterfaceC1675v0` is evaluated against the current `C1683x0` execution context via `I3.h.j(...)` (returns `Double`), `I3.h.m(...)` (returns `int`), `I3.h.l(...)` (returns `float`).
+3. **Coordinate conversion**: raw values are `%` (0–100), divided by 100, clamped to `[0,1]` by `x4.j.c(v, 0, 1)` (`C()`), then scaled by `DisplayMetrics` size (`E()`).
+
+### Main Loop (legacy path, `InteractTouch.b`)
+```
+v2()  →  set f16690R1 = now; z2(now, 0)
+  z2()  →  process boundary events; post run() at next-boundary (max 100ms)
+    run()  →  now = uptimeMillis(); z2(now, now - f16690R1)
+      z2() …
+```
+Each iteration:
+1. Determine earliest ending stroke within window → emit up events
+2. Determine earliest starting stroke → emit down events
+3. Emit a MOVE to interpolate all active strokes to current time
+4. If `U1 == 0` after processing → `q2(TRUE)` (complete); reschedule otherwise
+
+### Native path
+```
+s1()  → build GestureDescription → x0.y(a)
+AbstractStatement schedules → a.T1(service) → dispatchGesture(...)
+        ├─ onCompleted → q2(TRUE)  → x0(NULL, TRUE)
+        └─ onCancelled → q2(FALSE) → x0(NULL, FALSE)
+```
+
+---
+
+## 4. API Usage
+
+### Android APIs
+| API | Usage |
+|-----|-------|
+| `AccessibilityService.dispatchGesture(GestureDescription, GestureResultCallback, Handler)` | Native gesture injection (API 24+) |
+| `GestureDescription.Builder`, `StrokeDescription`, `getMaxGestureDuration()` | Gesture object construction |
+| `GestureDescription.Builder.setDisplayId(int)` | Multi-display routing (API 30+) |
+| `GestureResultCallback` | Async completion notification |
+| `Path`, `PathMeasure.getLength()`, `getPosTan()` | Path geometry and interpolation |
+| `MotionEvent.obtain(...)`, `PointerCoords`, `PointerProperties` | Synthetic multi-touch events (legacy) |
+| `ViewConfiguration.getTapTimeout/getLongPressTimeout/getDoubleTapTimeout` | Gesture timing constants |
+| `DisplayManager.getDisplay(int)` / `WindowManager.getDefaultDisplay()` | Display resolution |
+| `DisplayMetrics`, `Display.getRealSize`/`getMetrics` | Pixel-space coordinate scaling |
+| `SystemClock.uptimeMillis()` | Event timestamps |
+| `Build.VERSION.SDK_INT` | Capability gating (17, 24, 30) |
+
+### Automate Framework APIs
+- `AbstractStatement`, `Decision`, `AsyncStatement`, `AbstractC1587m2` — base classes
+- `InterfaceC1675v0` — expression evaluation handles
+- `C1600q` — scheduler context; `q2()` reports async result
+- `Q3.c`/`Q3.d` — reader/writer serialization
+- `s3.l` — injection bridge (obfuscated; likely wraps `InputManager.injectInputEvent` or a custom native path)
+
+### Non-Android
+No PC APIs (e.g., `ImageGrab`, `pyautogui`) appear — this is a **pure Android/mobile** module. There is **no screen capture** here; it is an **output-only** input injector. (State detection lives in a separate statement such as `InteractClick`/`ScreenMatch`; this class only *emits* gestures.)
+
+---
+
+## 5. Logic Flow — Step-by-Step Automation Sequence
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ 1. User defines statement in flow (gesture, coords, speed)   │
+└─────────────────────────────────────────────────────────────┘
+                         ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 2. Serialized via S(Q3.d) / deserialized via y0(Q3.c)        │
+│    Fields stored as InterfaceC1675v0 expression handles.     │
+└─────────────────────────────────────────────────────────────┘
+                         ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 3. Flow reaches this statement → s1(C1683x0) invoked         │
+│    • D() resolves display, size, density                     │
+│    • C() reads x/y as % → E() scales to pixels              │
+│    • switch(gesture):                                        │
+│        1 TAP         → y(..., tapTimeout/2)                  │
+│        2 LONG_PRESS  → y(..., longPressTimeout+50)           │
+│        3 DOUBLE_TAP  → two y() calls (timed gap)             │
+│        4 SWIPE       → F() line path + B() duration          │
+│        5 PINCH_IN    → A(false) two converging strokes       │
+│        6 PINCH_OUT   → A(true)  two diverging strokes        │
+└─────────────────────────────────────────────────────────────┘
+                         ▼
+           ┌─────────────┴─────────────┐
+   SDK ≥ 24 │                           │ SDK < 24
+           ▼                           ▼
+┌───────────────────────┐   ┌──────────────────────────────┐
+│ 4a. Build GestureDesc │   │ 4b. Build InteractTouch.b    │
+│  setDisplayId (API30) │   │  Validate max duration       │
+│  addStroke × N        │   │  Schedule via handler        │
+└───────────────────────┘   └──────────────────────────────┘
+           ▼                           ▼
+┌───────────────────────┐   ┌──────────────────────────────┐
+│ 5a. dispatchGesture() │   │ 5b. Ticker loop:             │
+│  → system injects     │   │  z2() → determine boundaries │
+│  → onCompleted/Cancel │   │  emit DOWN/MOVE/UP events    │
+│    → q2(TRUE/FALSE)   │   │  via s3.l bridge             │
+└───────────────────────┘   │  → q2(TRUE) when all done    │
+           ▼                └──────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│ 6. x0(ctx, T/F) called → o(ctx, success) → flow continues   │
+└────────────────

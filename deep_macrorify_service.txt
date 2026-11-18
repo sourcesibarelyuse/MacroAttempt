@@ -1,0 +1,166 @@
+# Technical Report: `EMMAccessibility` Service Analysis
+
+## Overview
+
+This is an obfuscated `AccessibilityService` implementation belonging to what appears to be an automation/macro framework (`com.kok_emm.mobile`). Despite its role as an accessibility service — which on Android is the privileged gateway for input injection, UI inspection, and screen content access — **this decompiled fragment contains almost no automation logic**. The class itself is essentially a thin lifecycle wrapper that exposes a singleton reference (`f17063h`) and notifies registered listener callbacks. The actual automation work (gesture dispatch, screen capture, state detection) lives elsewhere — likely dispatched to the `J3.a` listener interface retained via `f17064i`.
+
+What follows is a forensic breakdown.
+
+---
+
+## 1. Core Architecture
+
+### Class structure
+| Element | Purpose |
+|---|---|
+| `EMMAccessibility extends AccessibilityService` | The service shell registered with the accessibility framework. |
+| `static volatile EMMAccessibility f17063h` | A **volatile singleton** holding the live service instance — the global handle other components use to reach `dispatchGesture()`, `getRootInActiveWindow()`, etc. (indirectly, since none appears here). |
+| `static final ArrayList f17064i` | A registry of listener callbacks (`J3.a`). Acts as an observer list. |
+| `J3.a` | An obfuscated interface with at least one method `a(boolean)`. Likely a "connection state listener." |
+
+### Design patterns
+1. **Singleton (via static field)** — `f17063h` is assigned on `onServiceConnected()`/`onRebind()` and nulled in `onUnbind()`/`b()`. Access to the service is centralized.
+2. **Observer** — `f17064i` holds `J3.a` observers; `b(boolean)` broadcasts a state change by iterating the list and calling `listener.a(z9)`.
+3. **Facade / lifecycle shim** — The service deliberately implements *none* of the automation hooks (`onAccessibilityEvent` is empty). It exists only to (a) keep a handle and (b) signal connect/disconnect to the rest of the app.
+
+### Inheritance
+Inherits `AccessibilityService` → `Service` → `ContextWrapper` → `Context`. Standard Android service class hierarchy; no custom base class. The singleton + listener scheme suggests a larger framework: the real logic probably resides in a manager class that registers a `J3.a` with this service to learn when accessibility is ready, then drives gestures via `f17063h` (or a stored reference).
+
+---
+
+## 2. Key Methods
+
+### `onServiceConnected()`
+```java
+super.onServiceConnected();
+f17063h = this;          // publish singleton
+getApplicationContext(); // (dead call — return value ignored)
+```
+This is the **most important method**. When Android binds the accessibility service (user enables it in Settings), this fires. It publishes `this` to `f17063h`, making the accessibility handle available process-wide. Note it does **not** call `setServiceInfo()` — so no accessibility flags are configured here; configuration must be in `res/xml` (service metadata) or done by a caller later via `f17063h`.
+
+> `getApplicationContext()` with discarded return value is a **decompilation artifact** — likely the original code returned a context via an inlined accessor or the field assignment was optimized out. It appears in every override; treat as noise.
+
+### `b(boolean z9)` — disconnect broadcast
+```java
+f17063h = null;                     // drop singleton
+Iterator it = f17064i.iterator();
+while (it.hasNext()) ((a) it.next()).a(z9);  // notify all listeners
+```
+The boolean is the recorded reason/state (e.g., `true` = destruction, `false` = unbind). This is the **state-notification broadcast**: any component holding a `J3.a` learns that accessibility died.
+
+> ⚠️ **Concurrency defect:** modifies `f17064i` traversal without synchronization and can be invoked from two threads (`onDestroy`, `onUnbind`, `a()`). A concurrent `add` to `f17064i` would throw `ConcurrentModificationException`. `f17063h` is `volatile` but the list is not.
+
+### `a()` — self-disable helper
+```java
+if (service == null || SDK_INT < 24) return;
+service.disableSelf();               // API 24+ only
+b(false);                             // notify
+```
+Gracefully disables the accessibility service. `disableSelf()` requires **API level 24 (Android 7.0)**. This is the programmatic way to revoke your own accessibility permission — used by macro tools when the user turns off automation or when protection triggers.
+
+### `onAccessibilityEvent(AccessibilityEvent)` — **empty**
+Normally *the* central callback (fires on every window/UI change). **Empty body** is significant: this service does **not** use event-driven UI inspection. Automation must therefore be:
+- **Polling-based** (query `getRootInActiveWindow()` on a timer), and/or
+- **Image-based** (screen capture + template/color matching — consistent with a game macro that never reads the accessibility tree), and/or
+- **Gesture-driven** (`dispatchGesture()` — works without events).
+
+This strongly suggests an **image-recognition game macro** (e.g., "kok_emm" — Kok-style auto-clicker), not an accessibility-tree scraper.
+
+### Lifecycle methods
+| Method | Action |
+|---|---|
+| `onCreate` | `super.onCreate()`; discarded `getApplicationContext()` |
+| `onUnbind` | `b(false)`; **returns `true`** (request rebind → `onRebind` may fire) |
+| `onRebind` | `f17063h = this` (republish) |
+| `onDestroy` | `b(true)`; `super.onDestroy()` |
+| `onInterrupt` | no-op (required override) |
+
+The `onUnbind → return true → onRebind` pattern keeps the singleton valid across system-initiated unbind/rebind cycles without re-running `onServiceConnected`.
+
+---
+
+## 3. Data Flow
+
+```
+[User enables service in Settings]
+        │
+        ▼
+Android binds ──► onCreate() ──► onServiceConnected()
+                                        │
+                                        ▼
+                              f17063h = this   (singleton published)
+                                        │
+                 (listeners in f17064i are NOT notified here —
+                  connecting does not broadcast; only disconnect does)
+                                        │
+                                        ▼
+       ┌────────── External engine (elsewhere) polls f17063h ──────────┐
+       │  dispatchGesture / takeScreenshot / getRootInActiveWindow     │
+       │  (or image-capture pipeline + template match)                 │
+       └───────────────────────────────────────────────────────────────┘
+                                        │
+     system unbinds / user disables / a() called / onDestroy
+                                        │
+                                        ▼
+                              b(flag) → f17063h=null
+                                        │
+                          foreach J3.a listener → a(flag)
+```
+
+**Configuration loading:** None in this file. No `SharedPreferences`, no asset/JSON reads. Config must be loaded by the consumer (the manager that also registers `J3.a`) — not visible here.
+
+**Main loop:** Not present here. The automation loop lives in a separate engine class that likely:
+1. Waits for `f17063h != null` (or registers a `J3.a` to be signaled),
+2. Runs a `Handler`/thread loop performing capture → match → gesture,
+3. Gracefully calls `EMMAccessibility.a()` to disable itself when the script ends.
+
+---
+
+## 4. API Usage (Android)
+
+| API | Where | Notes |
+|---|---|---|
+| `android.accessibilityservice.AccessibilityService` | class | Base; provides `dispatchGesture`, `getRootInActiveWindow`, `takeScreenshot` (API 30+), `setServiceInfo`. |
+| `AccessibilityService.disableSelf()` | `a()` | Guarded by `SDK_INT >= 24`. Programmatic self-revocation. |
+| `Build.VERSION.SDK_INT` | `a()` | Version gating. |
+| `AccessibilityEvent` / `onAccessibilityEvent` | override | Declared but **unused** — no event inspection. |
+| `Service` lifecycle (`onCreate/onUnbind/onRebind/onDestroy`) | overrides | Bind management. |
+| `Intent` | `onUnbind/onRebind` | Standard service binding. |
+| `Application Context` | many | Artifact/dead calls. |
+
+**Notably absent** (implies they're in the unseen engine):
+- `dispatchGesture(GestureDescription, callback, handler)` — the gesture injection primitive.
+- `takeScreenshot()` (API 30+) / `MediaProjection` — for screen capture.
+- `ImageGrab`-style APIs (`ImageReader`, `Bitmap` compare) — for visual detection.
+- `getRootInActiveWindow()` / `AccessibilityNodeInfo` traversal — unnecessary given empty event handler.
+
+The choice of an **eventless AccessibilityService + external driver** is a common architecture for screen-reading macros: the service is used *purely as a privilege token* to obtain gesture dispatch and screenshot capability, while all decision logic (which is CPU-heavy: image matching) runs in a normal foreground service/thread that references `f17063h`.
+
+---
+
+## 5. Logic Flow (step-by-step)
+
+1. **Enablement** — User activates "kok_emm" in Android Accessibility Settings. System creates service → `onCreate()`.
+2. **Connect** — `onServiceConnected()` fires → `f17063h` set. Engine (elsewhere) that polls `f17063h` now sees a valid handle and begins automation.
+3. **Automation loop (external, inferred)** — Engine captures screen (MediaProjection/ImageReader or `takeScreenshot`), matches templates/colors, executes `dispatchGesture()` on `f17063h` repeatedly. No accessibility events consumed.
+4. **Observation opt-out** — `onAccessibilityEvent` ignores all events; the service is silent to the OS UI stream, minimizing overhead and detection surface.
+5. **Termination paths:**
+   - *User disables / OS unbinds* → `onUnbind()` → `b(false)` → singleton cleared → all `J3.a` listeners notified → `onRebind` (returns true kept) keeps future rebind possible.
+   - *App-triggered* → `EMMAccessibility.a()` → `disableSelf()` (API≥24) → `b(false)` → listeners told "off".
+   - *Destruction* → `onDestroy()` → `b(true)` → listeners told "destroyed".
+6. **Listener reaction** — Each `J3.a.a(boolean)` runs cleanup/halt logic in the macro engine, stopping the capture/injection loop.
+
+---
+
+## Analytical Conclusions
+
+- **Purpose:** Privileged gesture/screen-capture token for a mobile game macro (`kok_emm`), not a UI-automation tool. The empty `onAccessibilityEvent` is the tell.
+- **Real engine is external** — this class is a deliberately minimal handle + notifier. Any review of the full macro must locate the class holding `J3.a` registrations and calling `dispatchGesture`/`takeScreenshot`.
+- **Strengths:** Clean singleton lifecycle, correct `onUnbind`→`true` rebind handling, API-24 guard on `disableSelf`.
+- **Weaknesses / risks:**
+  - Unsynchronized `f17064i` mutation during iteration → potential `ConcurrentModificationException` (race between `b()` and listener add/remove).
+  - Empty `onAccessibilityEvent` foregoes UI-tree detection — implies polling/image approach (battery cost, false positives).
+  - `getApplicationContext()` litter throughout suggests heavy inlining/optimization artifacts from obfuscation (likely ProGuard/R8 + dex2jar smali reconstruction).
+  - `f17063h` published but never used internally — proof the class is a *token holder* for an unseen driver.
+
+**Recommended deep-dive targets for full reverse engineering:** trace `J3.a` implementations, whoever calls `EMMAccessibility.a()`, and the class that reads `f17063h` — that class contains the capture/match/gesture logic this report cannot see.

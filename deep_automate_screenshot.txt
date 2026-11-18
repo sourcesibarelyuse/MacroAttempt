@@ -1,0 +1,176 @@
+# Technical Reverse-Engineering Report: `Screenshot` Statement (Automate by LlamaLab)
+
+## 1. Core Architecture
+
+This class is a **statement node** in the *Automate* visual automation framework (LlamaLab). It represents the "Take Screenshot" block users drag onto flowcharts.
+
+**Class hierarchy (implied by annotations/methods):**
+
+```
+B2 (statement interface)
+ └── AbstractStatement (serialization, lifecycle, permission base)
+      └── Action (generic action base)
+           └── Screenshot  ← this class
+```
+
+**Implemented interfaces:**
+- `AsyncStatement` — completion happens asynchronously (via callback/UI-thread executor), not synchronously within `s1()`.
+- `IntentStatement` — participates in an `Activity`-based intent handshake (`X(...)` receives the result).
+
+**Design patterns:**
+- **Template Method**: `AbstractStatement` provides base serialization (`Q3.e` = `S`/`y0` read/write) and lifecycle hooks; `Screenshot` overrides the variable-slot read/write and the execute (`s1`) / resume (`x0`) hooks.
+- **Strategy / Variant dispatch**: Behavior branches on `Build.VERSION.SDK_INT` — three distinct capture strategies (AccessibilityService screenshot ≥30, MediaProjection 21–29, privileged legacy <21).
+- **Async callback pattern**: Capture result is delivered back into the flow via a runnable/callback object (`T0`, `S0`, `U0`) that `c1683x0.y(...)` schedules and that fault-handles via `a()`.
+- **Variable binding (dependency slots)**: `InterfaceC1675v0` and `I3.l` are "variable slots" — runtime-evaluable expressions bound to flow variables (`displayId`, `targetPath`, `varImageFile`).
+
+**Fields:**
+| Field | Type | Purpose |
+|---|---|---|
+| `displayId` | `InterfaceC1675v0` | Which display to capture (SDK-gated at version 94) |
+| `targetPath` | `InterfaceC1675v0` | Output file path (SAFS URI) |
+| `varImageFile` | `I3.l` | Optional flow variable to store the resulting image file |
+
+The `@E3.*` annotations are the plugin metadata system: title, icon, summary, help HTML (`screenshot.html`), and editor layout (`stmt_screenshot_edit`).
+
+---
+
+## 2. Key Methods
+
+### `M0(Context)` — Declared permissions
+Dynamically computes the permission set using **runtime `Build.VERSION.SDK_INT` branching**:
+- **SDK < 21**: `READ/WRITE_EXTERNAL_STORAGE` + custom `ACCESS_PRIVILEGED` (pre-scoped-storage era).
+- **SDK 21–29**: `READ/WRITE_EXTERNAL_STORAGE`.
+- **SDK 30+**: checks `Environment.isExternalStorageLegacy()`:
+  - *Legacy* → still `READ/WRITE_EXTERNAL_STORAGE` (+ an extra `c.f15488a` permission, likely `FOREGROUND_SERVICE`/projection-related).
+  - *Scoped* (non-legacy) → `c.f15499l` (likely `MANAGE_EXTERNAL_STORAGE` or a SAF-related permission) + `c.f15488a`.
+
+This is a textbook **permission-compatibility matrix** keyed to storage-model evolution.
+
+### `s1(C1683x0)` — **The main execution method**
+This is the core dispatch. Steps:
+
+1. `c1683x0.q(...)` — set progress title.
+2. `e(c1683x0)` — inherited pre-execution/permission check (from `AbstractStatement`).
+3. Branch on API level:
+
+   **A) SDK ≥ 30 → AccessibilityService `takeScreenshot`:**
+   ```java
+   AutomateAccessibilityService f8 = AbstractStatement.f();      // singleton
+   int m8 = I3.h.m(c1683x0, this.displayId, 0);                  // resolve displayId
+   com.llamalab.safs.n p8 = I3.h.p(c1683x0, this.targetPath);    // resolve path (SAFS)
+   T0 t02 = new T0(p8);                                          // callback wrapping output path
+   c1683x0.y(t02);                                               // register async continuation
+   f8.takeScreenshot(m8, c1683x0.getMainExecutor(), t02);        // ← the capture call
+   ```
+   Uses `AccessibilityService.takeScreenshot(int displayId, Executor, TakeScreenshotCallback)`. On throw, `t02.a()` tears down the continuation and rethrows.
+
+   **B) SDK 21–29 → MediaProjection consent flow:**
+   ```java
+   Intent i = MediaProjectionManager.createScreenCaptureIntent()
+       .addFlags(O_DIRECTORY);
+   c1683x0.C(i, null, 0L, true, icon, title, uri);   // launch Activity-for-result
+   ```
+   Execution **suspends**; control returns to the framework, which later invokes `X(...)` with the consent result. This is why the method returns `false` (async, not yet complete).
+
+   **C) SDK < 21 → privileged legacy capture:**
+   ```java
+   c1683x0.y(new U0(I3.h.p(c1683x0, this.targetPath)));
+   ```
+   Delegates to a privileged helper (`U0`, `ACCESS_PRIVILEGED`) that captures via root/system privileges.
+
+### `X(C1683x0, Intent)` — MediaProjection consent result handler
+- Extracts `RESULT_CODE` extra; throws `IllegalStateException("User canceled screen capture request")` if `≠ -1`.
+- Obtains `MediaProjectionManager` (via reflection shim `C1274b.k`), calls `getMediaProjection(code, RESULT_INTENT)` → `MediaProjection`.
+- Wraps in `S0` (capture-and-save runnable) and schedules via `c1683x0.y(...)`.
+- Returns `false` (flow continues via callback, not synchronously).
+
+### `x0(C1683x0, T, Object)` — Async completion resume
+The `AsyncStatement` completion hook — called when the capture runnable (`T0`/`S0`/`U0`) finishes:
+- If `varImageFile` slot is set, **assigns the produced image file object** to that flow variable: `c1683x0.A(lVar.f4429Y, obj)`.
+- Sets `onComplete` to advance the flow.
+
+### `S(...)` / `y0(...)` — Serialization
+`y0` deserializes slots (notes: `displayId` only read if graph version ≥ **94**, i.e., backward-compat guard); `S` writes them noting the same version.
+
+### `a(Visitor)` — Graph traversal / dependency visit
+Registers `onComplete` (inherited) plus its three slots so the flowchart engine can resolve expression dependencies and build the execution graph.
+
+---
+
+## 3. Data Flow
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ Flowchart (automate.json) parsed by AbstractStatement.y0()   │
+│  - displayId slot, targetPath slot, varImageFile slot        │
+└────────────────┬────────────────────────────────────────────┘
+                 │ variable binding resolution (I3.h.*)
+                 ▼
+          Screenshot.s1(ctx)
+                 │
+   ┌─────────────┼──────────────────────┐
+   ▼             ▼                       ▼
+ API≥30        API 21–29              API<21
+ASA.takeScreenshot   consent Intent      privileged U0
+   │             │  └─▶ X(ctx,intent) ─▶ MediaProjection ─▶ S0
+   ▼             ▼                       ▼
+  T0           (resume)                 (resume)
+   └─────────────┴──────────────────────┘
+                 │  stores file object into flow variable
+                 ▼
+           x0(ctx, result)  →  ctx.A(varImageFile, obj)  → onComplete
+```
+
+**Config loading**: Flowchart graph is deserialized via `y0` into slots and structural links; slots are lazily *resolved* at execution by `I3.h.p()` (path) and `I3.h.m()` (displayId).
+
+**Main loop**: The scheduler (`C1683x0`) drives `s1()` per node. If `s1` returns `true`, node done synchronously; here it returns `false`, meaning the scheduler waits for a registered continuation (`c1683x0.y(...)`), then resumes the flow via `x0`.
+
+---
+
+## 4. API Usage (Specific)
+
+| API | Usage |
+|---|---|
+| **`AccessibilityService.takeScreenshot(int, Executor, TakeScreenshotCallback)`** | SDK ≥ 30 capture; requires the app's automate AccessibilityService enabled. |
+| **`MediaProjectionManager.createScreenCaptureIntent()`** | SDK 21–29 consent UI. |
+| **`getMediaProjection(resultCode, resultIntent)`** | Turn consent result into `MediaProjection`. |
+| **`VirtualDisplay` + `ImageReader`** (inside `S0`, not shown) | Actual frame grab from `MediaProjection`. |
+| **`Activity.startActivityForResult`** (via `C1683x0.C(...)` framework shim) | Launches consent intent, tags it with icon/title/URI. |
+| **`Environment.isExternalStorageLegacy()`** | Decides permission set on SDK 30+. |
+| **`Build.VERSION.SDK_INT`** | Three-way strategy dispatch. |
+| **`com.llamalab.safs.n`** (SAFS — "Storage Access Framework for Scripts") | Path abstraction (URIs) for output; `I3.h.p` resolves. |
+| **`Context.getSystemService("media_projection")`** via `C1274b.k` | Reflection shim for API-level type differences. |
+| **`getMainExecutor()`** | Callback thread for ASA screenshot. |
+| **`Intent` extras**: `RESULT_CODE`, `RESULT_INTENT` | MediaProjection consent result passthrough. |
+| **`MoreOsConstants.O_DIRECTORY`** | Flag added to consent intent (legacy OS compat constant). |
+
+Note: `C1274b.k(...)` is clearly a **reflection/compat wrapper** used because `MediaProjectionManager` was relocated across `android.media` APIs; the cast surfaces that.
+
+---
+
+## 5. Logic Flow (Step-by-Step Automation Sequence)
+
+1. **Entry** — Scheduler invokes `Screenshot.s1(ctx)` after resolving/gating permissions from `M0(ctx)`.
+2. **Pre-checks** — `e(ctx)` validates dependencies and permission grants for the active SDK branch.
+3. **Strategy selection** by `SDK_INT`:
+   - **≥30**: Resolve `displayId` (default `0`) and `targetPath`; instantiate `T0(path)` callback; register via `ctx.y(...)`; call `AbstractStatement.f().takeScreenshot(display, mainExecutor, callback)`. If the call throws synchronously, `T0.a()` cancels continuation and rethrows.
+   - **21–29**: Build `createScreenCaptureIntent()` with flags; call `ctx.C(...)` to launch consent activity. Return `false` → flow parked.
+     - *User consents* → Android delivers result to `X(ctx, intent)`.
+     - *User cancels* → `RESULT_CODE ≠ -1` → `IllegalStateException`.
+     - *On success* → `MediaProjection` obtained → wrap in `S0(mediaProjection, targetPath)` → schedule via `ctx.y(...)`.
+   - **<21**: Schedule privileged `U0(targetPath)`.
+4. **Async capture** — `T0`/`S0`/`U0` perform actual pixel grab, encoding (likely PNG/JPEG), and SAF write to resolved path.
+5. **Completion** — framework invokes `x0(ctx, result, imageObject)`:
+   - If `varImageFile` bound, `ctx.A(slot, imageObject)` writes the image file into the flow variable for downstream use (e.g., an OCR or "Save to gallery" block).
+   - `onComplete` is set → flow advances to next node.
+
+**Conditional output contract**: `varImageFile` is the *optional* branch output — flow can either just save the file to path, or additionally capture the file handle into a variable for chaining.
+
+---
+
+### Observations / Reverse-Engineering Notes
+- **Version guard `94`** in `S`/`y0` is a **format evolution marker**: flowcharts saved before graph version 94 lack the `displayId` slot, so deserialization skips it.
+- **`AbstractStatement.f()`** returning `AutomateAccessibilityService` implies a **service singleton** — the class is a static accessor to the running accessibility instance.
+- Three capture backends reflect an intentional **graceful-degradation** design: modern API → user-consent projection → legacy privileged fallback.
+- The class is a **pure dispatcher + async coordinator**; the actual pixel/encoding work is entirely in the `T0`/`S0`/`U0` helper classes (not in this file).
+- `varImageFile.f4429Y` is the variable ID field used in `ctx.A(...)` — confirming the flow-variable write-back mechanism.
