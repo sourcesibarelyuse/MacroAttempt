@@ -50,6 +50,9 @@ interface LogPort {
 // ---- Compiler -----------------------------------------------------------
 
 class FlowCompiler {
+    companion object {
+        fun compile(ir: FlowIr): Program = FlowCompiler().compile(ir)
+    }
     private val out = ArrayList<KOp>()
     private val subEntry = LinkedHashMap<String, Int>()
     private val loopStack = ArrayList<LoopCtx>()
