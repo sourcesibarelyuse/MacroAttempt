@@ -290,7 +290,7 @@ class FloatingOverlayService : Service() {
         hideMenu()
         Thread {
             try {
-                app.coordinator.execute(script)
+                app.coordinator.execute(ScriptCompiler.compile(script))
             } catch (e: Exception) {
                 toast("Playback error: ${e.message}")
             }
