@@ -295,14 +295,11 @@ fun denorm(x: Double, y: Double, w: Int, h: Int): Pair<Int, Int> {
 
 fun jittered(ms: Long, seed: Long): Long {
     if (ms <= 0L) return ms
-    var v = seed + ms * 0x9E3779B97F4A7C15L
+    var v = (seed * 6364136223846793005L + 1442695040888963407L) xor (ms * 2654435761L)
     v = v xor (v ushr 33)
-    v *= 0xFF51AFD7ED558CCDL
+    v *= 0x5DEECE66DL
     v = v xor (v ushr 33)
-    v *= 0xC4CEB9FE1A85EC53L
-    v = v xor (v ushr 33)
-    val range = 0.2
-    val frac = ((v and 0x7FFFFFFFL).toDouble() / 0x7FFFFFFFL.toDouble()) * range - (range / 2.0)
+    val frac = ((v ushr 40).toDouble() / (1L shl 24).toDouble()) * 0.2 - 0.1
     val out = (ms.toDouble() * (1.0 + frac)).toLong()
     return if (out < 0L) 0L else out
 }
