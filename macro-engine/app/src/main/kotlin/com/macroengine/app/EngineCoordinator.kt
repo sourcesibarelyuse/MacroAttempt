@@ -20,6 +20,10 @@ class EngineCoordinator(@Suppress("unused") private val context: Context) {
 
     fun loadScript(dsl: String): FlowIr = Parser(dsl, "flow").parse()
 
+    fun stop() {
+        // TODO: wire cancellation to RunLane in M12
+    }
+
     fun execute(ir: FlowIr): RunResult {
         val injector = InjectorFactory.create()
         val program = FlowCompiler.compile(ir)
